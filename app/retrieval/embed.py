@@ -1,0 +1,3 @@
+"""
+Embedding generator module stub.
+"""

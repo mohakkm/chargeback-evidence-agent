@@ -1,0 +1,3 @@
+"""
+Evidence retrieval module stub.
+"""

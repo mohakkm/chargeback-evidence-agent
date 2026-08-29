@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+qdrant-client
+groq
+anthropic>=0.20.0
+streamlit
+pydantic
+python-dotenv
+
