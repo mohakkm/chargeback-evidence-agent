@@ -1,19 +1,22 @@
 """
-Verification script for Phase 3 Decision Agent (app/agent/decision_agent.py).
+Deterministic verification test suite for app/agent/decision_agent.py (Phase 3 & 4).
+
+No real Groq API calls, no Qdrant calls, no real sleep calls.
+Mocks the Groq client and time functions in-memory.
 
 Tests:
-1. Strict Input Sanitization & Ground-Truth Isolation (label_winnable, ground_truth_rationale, quality).
-2. Sparse / low_coverage=True case with NO strong evidence → expects no_contest, confidence <= 0.45.
-3. Sparse / low_coverage=True case with ONE strong delivery-confirmation doc → any decision allowed,
-   confidence must still be <= 0.45, used_fallback must be a bool.
-4. used_fallback field presence and type verified on all responses.
-
-If Groq is unavailable, the agent runs through the heuristic fallback and reports this clearly.
+  1. Input field isolation check (sanitize_dispute_input & sanitize_evidence_input).
+  2. Sparse evidence confidence calibration check.
+  3. Groq HTTP 429 rate limit retry + parsed delay -> success returns live LLM response (used_fallback=False).
+  4. Parsed wait time honors "try again in X seconds" (X + 1.0s).
+  5. Exhausted 429 retries fall back to heuristic reasoner with used_fallback=True.
+  6. Non-429 error does not retry and immediately falls back to heuristic reasoner with used_fallback=True.
 """
 
 import json
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -25,53 +28,50 @@ from app.agent.decision_agent import (
     sanitize_evidence_input,
     CleanDisputeInput,
     CleanEvidenceInput,
+    DecisionAgentResponse,
 )
 
-DATASETS_DIR = PROJECT_ROOT / "app" / "data" / "datasets"
 PASS = "[PASS]"
 FAIL = "[FAIL]"
 
 
-def load_holdout_cases():
-    filepath = DATASETS_DIR / "holdout.jsonl"
-    cases = []
-    if filepath.exists():
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    cases.append(json.loads(line))
-    return cases
+class MockGroqResponseChoice:
+    def __init__(self, content: str):
+        self.message = MagicMock(content=content)
 
 
-def verify_decision_agent():
+class MockGroqResponse:
+    def __init__(self, content_dict: dict):
+        self.choices = [MockGroqResponseChoice(json.dumps(content_dict))]
+
+
+def run_tests():
     print("=" * 80)
-    print("      RAZORPAY CHARGEBACK RESPONDER — PHASE 3 DECISION AGENT VERIFICATION")
+    print("      RAZORPAY CHARGEBACK RESPONDER - DECISION AGENT VERIFICATION")
     print("=" * 80)
     print()
 
     all_passed = True
+    results = []
 
     # -------------------------------------------------------------------------
     # TEST 1: Strict Input Field Isolation
     # -------------------------------------------------------------------------
-    print("[TEST 1] Strict Input Field Isolation Check")
-    print("-" * 60)
-
     raw_polluted_case = {
         "case_id": "CB-99999",
         "dispute_reason_code": "goods_not_received",
         "customer_claim_text": "Merchandise was never delivered.",
         "dispute_amount": 149.99,
         "merchant_category": "ecommerce",
-        "label_winnable": True,               # EVAL ONLY — must be stripped
-        "ground_truth_rationale": "Merchant has signed proof of delivery.",  # EVAL ONLY — must be stripped
+        "label_winnable": True,
+        "ground_truth_rationale": "Merchant has signed proof of delivery.",
     }
     raw_polluted_evidence = [
         {
             "evidence_id": "EVD-99999-01",
             "doc_type": "delivery_confirmation",
-            "content": "Carrier FedEx Tracking #12345. Status: DELIVERED. Signature captured.",
-            "quality": "strong",              # EVAL ONLY — must be stripped
+            "content": "Carrier FedEx Tracking #12345. Status: DELIVERED.",
+            "quality": "strong",
         }
     ]
 
@@ -81,132 +81,145 @@ def verify_decision_agent():
     dispute_fields = set(clean_dispute.model_dump().keys())
     evidence_fields = set(clean_evidence[0].model_dump().keys())
 
-    isolation_ok = (
+    ok1 = (
         "label_winnable" not in dispute_fields
         and "ground_truth_rationale" not in dispute_fields
         and "quality" not in evidence_fields
     )
-
-    print(f"Raw Case Keys        : {list(raw_polluted_case.keys())}")
-    print(f"Clean Dispute Fields : {sorted(dispute_fields)}")
-    print(f"Clean Evidence Fields: {sorted(evidence_fields)}")
-
-    if isolation_ok:
-        print(f"STATUS: {PASS} Strict field isolation verified. Evaluation-only fields completely stripped.")
-    else:
-        print(f"STATUS: {FAIL} Field isolation FAILED — eval fields leaked into sanitized input!")
-        all_passed = False
-
-    print()
+    results.append((
+        "TEST 1 - Strict input field isolation (ground-truth fields stripped)",
+        ok1,
+        f"dispute_fields={sorted(dispute_fields)}, evidence_fields={sorted(evidence_fields)}"
+    ))
 
     # -------------------------------------------------------------------------
-    # Instantiate agent once (shared across TEST 2 and TEST 3)
+    # TEST 2: Low coverage confidence calibration
     # -------------------------------------------------------------------------
-    agent = DecisionAgent()
-    groq_available = agent._client is not None
-    print(f"[Agent Mode] Groq available: {groq_available} | Model: {agent.model}")
-    if not groq_available:
-        print("            ⚠  Groq unavailable — running via heuristic fallback. Results will show used_fallback=True.")
-    print()
-
-    # -------------------------------------------------------------------------
-    # TEST 2: Sparse / low_coverage=True — NO strong evidence
-    # -------------------------------------------------------------------------
-    print("[TEST 2] Sparse / low_coverage=True — No Evidence (expect no_contest, confidence <= 0.45)")
-    print("-" * 60)
-
-    sparse_dispute_no_ev = CleanDisputeInput(
-        dispute_reason_code="unauthorized_transaction",
-        customer_claim_text="Fraudulent charge of $200.00 at Frost Inc on 2026-07-02. Not authorized by me.",
-        dispute_amount=200.00,
-        merchant_category="ecommerce",
-    )
-    sparse_ev_none: list[CleanEvidenceInput] = []
-
-    resp_no_ev = agent.evaluate_dispute(
-        dispute=sparse_dispute_no_ev,
-        evidence=sparse_ev_none,
-        low_coverage=True,
-    )
-
-    print(f"Decision       : {resp_no_ev.decision.upper()}")
-    print(f"Confidence     : {resp_no_ev.confidence:.4f}")
-    print(f"used_fallback  : {resp_no_ev.used_fallback}")
-    print(f"Reasoning      : {resp_no_ev.reasoning_summary}")
-
-    t2_conf_ok = resp_no_ev.confidence <= 0.45
-    t2_fallback_ok = isinstance(resp_no_ev.used_fallback, bool)
-    t2_decision_ok = resp_no_ev.decision in ("contest", "no_contest")
-
-    status_2 = PASS if (t2_conf_ok and t2_fallback_ok and t2_decision_ok) else FAIL
-    if not (t2_conf_ok and t2_fallback_ok and t2_decision_ok):
-        all_passed = False
-
-    print(f"Assert confidence <= 0.45 : {'OK' if t2_conf_ok else 'FAIL'} ({resp_no_ev.confidence:.4f})")
-    print(f"Assert used_fallback bool : {'OK' if t2_fallback_ok else 'FAIL'}")
-    print(f"Assert valid decision     : {'OK' if t2_decision_ok else 'FAIL'}")
-    print(f"STATUS: {status_2}")
-    print()
-
-    # -------------------------------------------------------------------------
-    # TEST 3: Sparse / low_coverage=True — ONE strong delivery-confirmation doc
-    # -------------------------------------------------------------------------
-    print("[TEST 3] Sparse / low_coverage=True — One Strong Delivery-Confirmation Doc (any decision, confidence <= 0.45)")
-    print("-" * 60)
-
-    sparse_dispute_one_ev = CleanDisputeInput(
+    agent_heuristic = DecisionAgent(api_key="dummy")
+    dispute_sparse = CleanDisputeInput(
         dispute_reason_code="goods_not_received",
-        customer_claim_text="Package was never delivered despite paying $89.50 to QuickShip Co on 2026-07-15.",
+        customer_claim_text="Item not delivered",
         dispute_amount=89.50,
-        merchant_category="ecommerce",
     )
-    sparse_ev_one = [
-        CleanEvidenceInput(
-            evidence_id="EVD-TEST-01",
-            doc_type="delivery_confirmation",
-            content=(
-                "Carrier FedEx Tracking #TRK-78234. Status: DELIVERED on 2026-07-17 at 14:32 UTC. "
-                "Package delivered to billing address: 45 Maple Ave, Austin TX 78701. "
-                "Recipient signature captured: J. Smith. Photo proof available."
-            ),
-            score=0.91,
-        )
-    ]
+    resp_sparse = agent_heuristic.evaluate_dispute(dispute=dispute_sparse, evidence=[], low_coverage=True)
 
-    resp_one_ev = agent.evaluate_dispute(
-        dispute=sparse_dispute_one_ev,
-        evidence=sparse_ev_one,
-        low_coverage=True,
-    )
-
-    print(f"Decision       : {resp_one_ev.decision.upper()}")
-    print(f"Confidence     : {resp_one_ev.confidence:.4f}")
-    print(f"used_fallback  : {resp_one_ev.used_fallback}")
-    print(f"Reasoning      : {resp_one_ev.reasoning_summary}")
-    if resp_one_ev.decision == "contest" and resp_one_ev.rebuttal_draft:
-        snippet = resp_one_ev.rebuttal_draft[:150].replace("\n", " ")
-        print(f"Rebuttal snip  : {snippet}...")
-
-    t3_conf_ok = resp_one_ev.confidence <= 0.45
-    t3_fallback_ok = isinstance(resp_one_ev.used_fallback, bool)
-    t3_decision_ok = resp_one_ev.decision in ("contest", "no_contest")
-
-    status_3 = PASS if (t3_conf_ok and t3_fallback_ok and t3_decision_ok) else FAIL
-    if not (t3_conf_ok and t3_fallback_ok and t3_decision_ok):
-        all_passed = False
-
-    print(f"Assert confidence <= 0.45 : {'OK' if t3_conf_ok else 'FAIL'} ({resp_one_ev.confidence:.4f})")
-    print(f"Assert used_fallback bool : {'OK' if t3_fallback_ok else 'FAIL'}")
-    print(f"Assert valid decision     : {'OK' if t3_decision_ok else 'FAIL'}")
-    print(f"Note: decision can be either contest or no_contest — confidence cap is what matters here")
-    print(f"STATUS: {status_3}")
-    print()
+    ok2 = resp_sparse.confidence <= 0.45 and isinstance(resp_sparse.used_fallback, bool)
+    results.append((
+        "TEST 2 - Sparse low_coverage=True caps confidence at <= 0.45",
+        ok2,
+        f"decision={resp_sparse.decision}, confidence={resp_sparse.confidence}, fallback={resp_sparse.used_fallback}"
+    ))
 
     # -------------------------------------------------------------------------
-    # Summary
+    # TEST 3 & 4: Groq 429 retry + parsed delay -> success (used_fallback=False)
     # -------------------------------------------------------------------------
+    mock_client = MagicMock()
+    error_429 = Exception("Error 429: Rate limit reached. Please try again in 3.4s.")
+
+    valid_llm_json = {
+        "decision": "contest",
+        "confidence": 0.92,
+        "rebuttal_draft": "Formal LLM rebuttal draft.",
+        "reasoning_summary": "Strong evidence supports contesting.",
+    }
+    success_response = MockGroqResponse(valid_llm_json)
+
+    # First call 429, second call succeeds
+    mock_client.chat.completions.create.side_effect = [error_429, success_response]
+
+    agent_mocked = DecisionAgent(api_key="fake_key")
+    agent_mocked._client = mock_client
+
+    sleep_calls = []
+    with patch("time.sleep", side_effect=lambda s: sleep_calls.append(s)), \
+         patch("time.monotonic", return_value=100.0):
+
+        resp3 = agent_mocked.evaluate_dispute(dispute=dispute_sparse, evidence=[], low_coverage=False)
+
+    ok3 = (
+        resp3.used_fallback is False and
+        resp3.decision == "contest" and
+        mock_client.chat.completions.create.call_count == 2
+    )
+    # Parsed delay 3.4s -> wait time should be 3.4 + 1.0 = 4.4s
+    ok4 = len(sleep_calls) >= 1 and any(abs(s - 4.4) < 0.01 for s in sleep_calls)
+
+    results.append((
+        "TEST 3 - 429 rate limit retry followed by success returns live LLM response (used_fallback=False)",
+        ok3,
+        f"used_fallback={resp3.used_fallback}, decision={resp3.decision}, api_calls={mock_client.chat.completions.create.call_count}"
+    ))
+    results.append((
+        "TEST 4 - Parsed retry delay honors 'try again in 3.4s' (waits 4.4s)",
+        ok4,
+        f"sleep_calls={sleep_calls}"
+    ))
+
+    # -------------------------------------------------------------------------
+    # TEST 5: Exhausted 429 retries fall back to heuristic reasoner (used_fallback=True)
+    # -------------------------------------------------------------------------
+    mock_client_fail = MagicMock()
+    mock_client_fail.chat.completions.create.side_effect = Exception("429 Rate limit error")
+
+    agent_fail = DecisionAgent(api_key="fake_key")
+    agent_fail._client = mock_client_fail
+
+    sleep_calls_fail = []
+    with patch("time.sleep", side_effect=lambda s: sleep_calls_fail.append(s)), \
+         patch("time.monotonic", return_value=100.0), \
+         patch.dict("os.environ", {"GROQ_MAX_RATE_LIMIT_RETRIES": "2"}):
+
+        resp5 = agent_fail.evaluate_dispute(dispute=dispute_sparse, evidence=[], low_coverage=False)
+
+    ok5 = (
+        resp5.used_fallback is True and
+        mock_client_fail.chat.completions.create.call_count == 3  # 1 initial + 2 retries
+    )
+    results.append((
+        "TEST 5 - Exhausted 429 retries fall back to heuristic reasoner (used_fallback=True)",
+        ok5,
+        f"used_fallback={resp5.used_fallback}, calls={mock_client_fail.chat.completions.create.call_count}, sleep_count={len(sleep_calls_fail)}"
+    ))
+
+    # -------------------------------------------------------------------------
+    # TEST 6: Non-429 error does NOT retry and immediately falls back
+    # -------------------------------------------------------------------------
+    mock_client_401 = MagicMock()
+    mock_client_401.chat.completions.create.side_effect = Exception("401 Invalid API Key")
+
+    agent_401 = DecisionAgent(api_key="fake_key")
+    agent_401._client = mock_client_401
+
+    sleep_calls_401 = []
+    with patch("time.sleep", side_effect=lambda s: sleep_calls_401.append(s)), \
+         patch("time.monotonic", return_value=100.0):
+
+        resp6 = agent_401.evaluate_dispute(dispute=dispute_sparse, evidence=[], low_coverage=False)
+
+    ok6 = (
+        resp6.used_fallback is True and
+        mock_client_401.chat.completions.create.call_count == 1 and
+        len(sleep_calls_401) == 0
+    )
+    results.append((
+        "TEST 6 - Non-429 error (401 Bad Key) does NOT retry and immediately uses fallback",
+        ok6,
+        f"used_fallback={resp6.used_fallback}, calls={mock_client_401.chat.completions.create.call_count}, sleep_count={len(sleep_calls_401)}"
+    ))
+
+    # -------------------------------------------------------------------------
+    # Print results
+    # -------------------------------------------------------------------------
+    for label, passed, details in results:
+        status = PASS if passed else FAIL
+        if not passed:
+            all_passed = False
+        print(f"{status}  {label}")
+        print(f"        Details: {details}")
+        print()
+
     print("=" * 80)
-    overall = "ALL CHECKS PASSED" if all_passed else "ONE OR MORE CHECKS FAILED"
+    overall = "ALL TESTS PASSED" if all_passed else "ONE OR MORE TESTS FAILED"
     print(f"      {overall}")
     print("=" * 80)
 
@@ -215,4 +228,4 @@ def verify_decision_agent():
 
 
 if __name__ == "__main__":
-    verify_decision_agent()
+    run_tests()

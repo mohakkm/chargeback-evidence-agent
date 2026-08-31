@@ -7,7 +7,7 @@ Outputs structured JSON decisions:
 - confidence: float (0.0 to 1.0)
 - rebuttal_draft: formal merchant evidence packet text (if contesting)
 - reasoning_summary: 2-3 sentence internal audit note explaining rationale
-- used_fallback: bool — True when heuristic reasoner was used instead of Groq
+- used_fallback: bool - True when heuristic reasoner was used instead of Groq
 
 STRICT SECURITY RULE:
 The decision agent NEVER receives evaluation-only ground-truth fields:
@@ -19,12 +19,19 @@ These fields are explicitly stripped at the function signature / sanitization le
 
 CONFIDENCE CALIBRATION RULE:
 Post-validation safeguard: if low_coverage=True, returned confidence is capped at 0.45
-regardless of the model's raw output. This is confidence calibration only — it never
+regardless of the model's raw output. This is confidence calibration only - it never
 changes the decision itself. Action-gate hard-blocking lives downstream.
+
+RATE LIMIT & PACING RULE:
+Paces requests using GROQ_MIN_REQUEST_INTERVAL_SECONDS (default 16s).
+On HTTP 429 rate limit errors, retries up to GROQ_MAX_RATE_LIMIT_RETRIES (default 3)
+with delay parsed from error text (X + 1s buffer) or bounded exponential backoff.
 """
 
 import json
 import os
+import re
+import time
 from typing import List, Dict, Any, Optional, Literal
 from pydantic import BaseModel, Field
 
@@ -35,7 +42,7 @@ _LOW_COVERAGE_CONFIDENCE_CAP = 0.45
 
 
 class CleanDisputeInput(BaseModel):
-    """Sanitized dispute case input — guaranteed free of ground-truth evaluation fields."""
+    """Sanitized dispute case input - guaranteed free of ground-truth evaluation fields."""
     dispute_reason_code: str
     customer_claim_text: str
     dispute_amount: Optional[float] = 0.0
@@ -44,7 +51,7 @@ class CleanDisputeInput(BaseModel):
 
 
 class CleanEvidenceInput(BaseModel):
-    """Sanitized evidence document input — guaranteed free of quality evaluation field."""
+    """Sanitized evidence document input - guaranteed free of quality evaluation field."""
     evidence_id: str
     doc_type: str
     content: str
@@ -109,7 +116,7 @@ def _apply_confidence_calibration(confidence: float, low_coverage: bool) -> floa
     """
     Post-validation confidence calibration safeguard.
     If low_coverage=True, caps confidence at _LOW_COVERAGE_CONFIDENCE_CAP (0.45).
-    Never changes the decision — purely a confidence calibration step.
+    Never changes the decision - purely a confidence calibration step.
     """
     if low_coverage:
         return min(confidence, _LOW_COVERAGE_CONFIDENCE_CAP)
@@ -133,6 +140,7 @@ class DecisionAgent:
         self.api_key = api_key or os.environ.get("GROQ_API_KEY", "") or CONFIG_API_KEY
         self.model = model or os.environ.get("GROQ_MODEL", "") or CONFIG_MODEL or "openai/gpt-oss-120b"
         self._client = None
+        self._last_request_time: Optional[float] = None
 
         if self.api_key and self.api_key not in ("your-anthropic-api-key-here", "dummy"):
             try:
@@ -140,6 +148,74 @@ class DecisionAgent:
                 self._client = Groq(api_key=self.api_key)
             except Exception as e:
                 print(f"[DecisionAgent] Warning: Groq client initialization failed ({e}). Using fallback reasoner.")
+
+    def _apply_pacing(self) -> None:
+        """
+        Enforces a minimum interval between requests (default 16 seconds)
+        using time.monotonic().
+        """
+        min_interval_str = os.environ.get("GROQ_MIN_REQUEST_INTERVAL_SECONDS", "16.0")
+        try:
+            min_interval = float(min_interval_str)
+        except ValueError:
+            min_interval = 16.0
+
+        if min_interval <= 0:
+            self._last_request_time = time.monotonic()
+            return
+
+        now = time.monotonic()
+        if self._last_request_time is not None:
+            elapsed = now - self._last_request_time
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+
+        self._last_request_time = time.monotonic()
+
+    @staticmethod
+    def _is_rate_limit_error(e: Exception) -> bool:
+        """
+        Detects if an exception represents a 429 / Rate Limit error.
+        """
+        status_code = getattr(e, "status_code", None)
+        if status_code == 429:
+            return True
+
+        err_type = type(e).__name__
+        if err_type in ("RateLimitError", "APIStatusError") and status_code == 429:
+            return True
+
+        err_str = str(e).lower()
+        if "429" in err_str or "rate limit" in err_str or "rate_limit" in err_str or "try again in" in err_str:
+            return True
+
+        return False
+
+    @staticmethod
+    def _parse_retry_delay(e: Exception, attempt: int) -> float:
+        """
+        Parses retry delay from error message if available (adding 1 sec buffer),
+        otherwise uses bounded exponential backoff [5.0, 10.0, 20.0].
+        """
+        err_msg = str(e)
+        patterns = [
+            r"try again in ([\d\.]+)\s*s",
+            r"try again in ([\d\.]+)\s*second",
+            r"in ([\d\.]+)\s*s",
+            r"in ([\d\.]+)\s*second",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, err_msg, re.IGNORECASE)
+            if match:
+                try:
+                    parsed_val = float(match.group(1))
+                    return max(parsed_val + 1.0, 1.0)
+                except ValueError:
+                    pass
+
+        default_backoffs = [5.0, 10.0, 20.0]
+        idx = min(attempt - 1, len(default_backoffs) - 1)
+        return default_backoffs[max(0, idx)]
 
     def evaluate_dispute(
         self,
@@ -165,7 +241,7 @@ class DecisionAgent:
                 response.confidence = _apply_confidence_calibration(response.confidence, low_coverage)
                 return response
             except Exception as e:
-                print(f"[DecisionAgent] Groq API call failed: {e}. Falling back to heuristic reasoner.")
+                print(f"[DecisionAgent] Groq API call failed ({e}). Falling back to heuristic reasoner.")
 
         response = self._evaluate_heuristic(dispute, evidence, low_coverage)
         # Apply post-validation confidence calibration on fallback path too
@@ -199,7 +275,7 @@ class DecisionAgent:
         low_coverage: bool
     ) -> DecisionAgentResponse:
         """
-        Executes structured JSON reasoning via Groq Chat Completions API.
+        Executes structured JSON reasoning via Groq Chat Completions API with rate-limit retries & pacing.
         Sets used_fallback=False on all successful Groq responses.
         """
         system_prompt = (
@@ -212,10 +288,10 @@ class DecisionAgent:
             "4. If evidence is missing, weak, or supports the customer claim, decide 'no_contest'.\n"
             "5. CONFIDENCE CALIBRATION PRINCIPLE: Confidence must reflect the amount and strength of evidence actually available, not merely whether a plausible decision can be suggested. "
             "If the available evidence is insufficient to make a confident determination in either direction, output low confidence regardless of which way you lean on the decision. "
-            "Do not output high confidence simply because you can form a plausible argument — high confidence requires strong, specific, directly relevant evidence.\n"
+            "Do not output high confidence simply because you can form a plausible argument - high confidence requires strong, specific, directly relevant evidence.\n"
             "6. low_coverage=True in the user prompt means fewer than 2 evidence documents were retrieved. "
-            "Factor this into your raw confidence score naturally (sparse evidence → lower confidence). "
-            "Do not use low_coverage to override a 'contest' decision to 'no_contest' — make the best decision the evidence supports regardless.\n"
+            "Factor this into your raw confidence score naturally (sparse evidence -> lower confidence). "
+            "Do not use low_coverage to override a 'contest' decision to 'no_contest' - make the best decision the evidence supports regardless.\n"
             "7. When decision is 'contest', write a formal, highly professional, point-by-point Merchant Rebuttal Letter (rebuttal_draft) addressed to the acquiring bank dispute committee. "
             "Cite specific order IDs, tracking numbers, timestamps, IP addresses, 2FA/3DS proof, or policy clauses from the evidence documents.\n"
             "8. When decision is 'no_contest', set rebuttal_draft to an empty string ''.\n"
@@ -242,16 +318,41 @@ class DecisionAgent:
             f'{{"decision": "contest" | "no_contest", "confidence": <float 0-1>, "rebuttal_draft": "<string>", "reasoning_summary": "<string>"}}'
         )
 
-        response = self._client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.1,
-            max_tokens=1024,
-        )
+        max_retries_str = os.environ.get("GROQ_MAX_RATE_LIMIT_RETRIES", "3")
+        try:
+            max_retries = int(max_retries_str)
+        except ValueError:
+            max_retries = 3
+
+        attempt = 0
+        response = None
+
+        while True:
+            self._apply_pacing()
+            try:
+                response = self._client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.1,
+                    max_tokens=1024,
+                )
+                break
+            except Exception as e:
+                if self._is_rate_limit_error(e) and attempt < max_retries:
+                    attempt += 1
+                    wait_seconds = self._parse_retry_delay(e, attempt)
+                    print(
+                        f"[DecisionAgent] Groq rate limit hit (429). "
+                        f"Waiting {wait_seconds:.1f}s before retry {attempt}/{max_retries}..."
+                    )
+                    time.sleep(wait_seconds)
+                    self._last_request_time = time.monotonic()
+                else:
+                    raise e
 
         raw_json = response.choices[0].message.content
         data = json.loads(raw_json)
@@ -306,7 +407,6 @@ class DecisionAgent:
 
         if strong_evidence_found and len(evidence) >= 2:
             decision = "contest"
-            # Raw confidence before low_coverage cap (applied by caller)
             confidence = 0.88
             evidence_summary = "\n".join([f"- [{e.doc_type.upper()}] {e.content}" for e in evidence[:3]])
             rebuttal_draft = (
@@ -338,10 +438,9 @@ class DecisionAgent:
                 f"Moderate evidence present for {reason_code}. Contesting with moderate confidence score."
             )
         elif len(evidence) >= 1 and low_coverage:
-            # One doc present but low_coverage — let the evidence decide, confidence capped upstream
             if strong_evidence_found:
                 decision = "contest"
-                confidence = 0.70  # will be capped to 0.45 by _apply_confidence_calibration
+                confidence = 0.70
                 evidence_summary = evidence[0].content
                 rebuttal_draft = (
                     f"REBUTTAL STATEMENT FOR DISPUTE {dispute.dispute_reason_code.upper()}\n"
@@ -355,7 +454,7 @@ class DecisionAgent:
                 )
             else:
                 decision = "no_contest"
-                confidence = 0.35  # will be capped to 0.35 (already <= 0.45)
+                confidence = 0.35
                 rebuttal_draft = ""
                 reasoning_summary = (
                     f"One weak evidence document retrieved for {reason_code} (low_coverage=True). "
