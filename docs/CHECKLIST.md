@@ -13,9 +13,9 @@
 - [x] Build retrieval pipeline keyed on dispute reason code
 
 ## Phase 3 — Decision Agent
-- [ ] LLM reasoning step: dispute + evidence → contest/don't-contest + drafted
+- [x] LLM reasoning step: dispute + evidence → contest/don't-contest + drafted
       rebuttal packet
-- [ ] Confidence scoring
+- [x] Confidence scoring
 - [ ] Bounded action gate (auto-submit vs. flag-for-review threshold)
 
 ## Phase 4 — Audit Trail & Eval

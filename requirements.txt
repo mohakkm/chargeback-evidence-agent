@@ -1,10 +1,8 @@
 fastapi
 uvicorn
 qdrant-client
-groq
-anthropic>=0.20.0
+groq>=1.7.0
 sentence-transformers
 streamlit
 pydantic
 python-dotenv
-
