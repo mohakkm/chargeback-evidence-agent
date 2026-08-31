@@ -8,9 +8,9 @@
       hold out 20-30%
 
 ## Phase 2 — Retrieval
-- [ ] Stand up Qdrant instance
-- [ ] Embed evidence documents
-- [ ] Build retrieval pipeline keyed on dispute reason code
+- [x] Stand up Qdrant instance (embedded local mode at ./qdrant_data)
+- [x] Embed evidence documents (multilingual-e5-large model)
+- [x] Build retrieval pipeline keyed on dispute reason code
 
 ## Phase 3 — Decision Agent
 - [ ] LLM reasoning step: dispute + evidence → contest/don't-contest + drafted

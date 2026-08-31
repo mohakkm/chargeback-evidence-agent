@@ -17,6 +17,7 @@ app/data/datasets/*.jsonl
 !app/data/datasets/.gitkeep
 audit_logs.jsonl
 qdrant_storage/
+qdrant_data/
 
 # IDE & OS
 .vscode/
