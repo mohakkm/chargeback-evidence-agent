@@ -179,14 +179,21 @@ class DecisionAgent:
         self._last_request_time = time.monotonic()
 
     @staticmethod
-    def _is_json_max_tokens_error(e: Exception) -> bool:
+    def _is_json_validation_error(e: Exception) -> bool:
         """
-        Detects HTTP 400 errors specifically caused by JSON validation failure due to max completion tokens limit.
+        Detects HTTP 400 errors specifically caused by JSON validation or generation failure in Groq.
+        Triggers on 'json_validate_failed' or 'failed to generate json'.
+        Does not trigger on unrelated HTTP 400 errors (e.g., invalid parameters).
         """
         err_str = str(e).lower()
         status_code = getattr(e, "status_code", None)
         is_400 = (status_code == 400) or ("400" in err_str) or ("bad request" in err_str) or ("badrequest" in err_str)
-        return is_400 and ("json_validate_failed" in err_str) and ("max completion tokens" in err_str)
+        if not is_400:
+            return False
+
+        return ("json_validate_failed" in err_str) or ("failed to generate json" in err_str)
+
+    _is_json_max_tokens_error = _is_json_validation_error
 
     @staticmethod
     def _is_rate_limit_error(e: Exception) -> bool:
@@ -238,17 +245,15 @@ class DecisionAgent:
             return (
                 "You are a Senior Chargeback Dispute Operations Specialist at Razorpay.\n"
                 "Your task is to analyze credit card dispute claims against retrieved evidence documentation and decide whether the merchant should CONTEST the chargeback or submit NO CONTEST.\n\n"
-                "RULES:\n"
-                "1. Analyze the dispute reason code and card network rules.\n"
-                "2. Evaluate evidence documents for customer authorization, delivery, or terms compliance.\n"
-                "3. Decide 'contest' if evidence refutes customer claim; otherwise decide 'no_contest'.\n"
-                "4. CONFIDENCE CALIBRATION PRINCIPLE: Confidence must reflect evidence strength.\n"
-                "5. low_coverage=True means sparse evidence; factor into confidence score.\n"
-                "6. When decision is 'contest', write an ultra-compact Merchant Rebuttal Letter (rebuttal_draft, MAXIMUM 120 WORDS). "
+                "STRICT OUTPUT REQUIREMENTS:\n"
+                "1. Respond ONLY with a literal valid JSON object. Do NOT wrap output in markdown code blocks, backticks, or prose.\n"
+                "2. The 'confidence' value MUST be a raw JSON number between 0.0 and 1.0 (e.g. 0.85), NEVER words or a quoted string.\n"
+                "3. When decision is 'contest', write an ultra-compact Merchant Rebuttal Letter (rebuttal_draft, MAXIMUM 120 WORDS). "
                 "Cite at most 2 strongest specific evidence facts.\n"
-                "7. When decision is 'no_contest', set rebuttal_draft to an empty string ''.\n"
-                "8. Provide an ultra-concise reasoning_summary (MAXIMUM 35 WORDS) for internal audit logging.\n"
-                "9. Output ONLY a valid JSON object matching the requested schema."
+                "4. When decision is 'no_contest', set rebuttal_draft to an empty string ''.\n"
+                "5. Provide an ultra-concise reasoning_summary (MAXIMUM 35 WORDS) for internal audit logging.\n\n"
+                "REQUIRED JSON SHAPE EXAMPLE:\n"
+                '{"decision": "contest", "confidence": 0.85, "rebuttal_draft": "Merchant records show...", "reasoning_summary": "Strong 3DS proof available."}'
             )
         return (
             "You are a Senior Chargeback Dispute Operations Specialist at Razorpay.\n"
@@ -406,9 +411,9 @@ class DecisionAgent:
         try:
             raw_json = self._call_groq_completions(sys_prompt, usr_prompt)
         except Exception as e:
-            if self._is_json_max_tokens_error(e):
+            if self._is_json_validation_error(e):
                 print(
-                    "[DecisionAgent] Groq HTTP 400 json_validate_failed (max completion tokens) encountered. "
+                    "[DecisionAgent] Groq HTTP 400 JSON generation failure encountered. "
                     "Retrying once with compact prompt..."
                 )
                 compact_sys_prompt = self._build_system_prompt(compact=True)

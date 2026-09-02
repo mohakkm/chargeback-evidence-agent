@@ -208,7 +208,7 @@ def run_tests():
     ))
 
     # -------------------------------------------------------------------------
-    # TEST 7: Groq 400 json_validate_failed max completion tokens -> compact retry success (used_fallback=False)
+    # TEST 7A: Groq 400 json_validate_failed max completion tokens -> compact retry success (used_fallback=False)
     # -------------------------------------------------------------------------
     mock_client_400_json = MagicMock()
     error_400_json = Exception("HTTP 400 Bad Request: json_validate_failed - failed_generation: max completion tokens reached before generating a valid document")
@@ -239,12 +239,39 @@ def run_tests():
         mock_client_400_json.chat.completions.create.call_count == 2 and
         "120" in second_call_sys_prompt and
         "35" in second_call_sys_prompt and
-        "2" in second_call_sys_prompt
+        "2" in second_call_sys_prompt and
+        "raw JSON number" in second_call_sys_prompt and
+        "REQUIRED JSON SHAPE EXAMPLE" in second_call_sys_prompt
     )
     results.append((
-        "TEST 7 - Groq 400 json_validate_failed max tokens retries once with compact prompt and succeeds (used_fallback=False)",
+        "TEST 7A - Groq 400 json_validate_failed max tokens retries once with strengthened compact prompt (used_fallback=False)",
         ok7,
         f"used_fallback={resp7.used_fallback}, decision={resp7.decision}, api_calls={mock_client_400_json.chat.completions.create.call_count}, contains_compact_limits={'120' in second_call_sys_prompt and '35' in second_call_sys_prompt}"
+    ))
+
+    # -------------------------------------------------------------------------
+    # TEST 7B: Generic Groq 400 Failed to generate JSON (without max tokens phrase) -> compact retry success
+    # -------------------------------------------------------------------------
+    mock_client_400_gen = MagicMock()
+    error_400_gen = Exception("HTTP 400 Bad Request: code=json_validate_failed msg=Failed to generate JSON. Please adjust your prompt.")
+
+    mock_client_400_gen.chat.completions.create.side_effect = [error_400_gen, success_response_compact]
+
+    agent_400_gen = DecisionAgent(api_key="fake_key")
+    agent_400_gen._client = mock_client_400_gen
+
+    with patch("time.sleep"), patch("time.monotonic", return_value=100.0):
+        resp7b = agent_400_gen.evaluate_dispute(dispute=dispute_sparse, evidence=[], low_coverage=False)
+
+    ok7b = (
+        resp7b.used_fallback is False and
+        resp7b.decision == "contest" and
+        mock_client_400_gen.chat.completions.create.call_count == 2
+    )
+    results.append((
+        "TEST 7B - Generic Groq 400 Failed to generate JSON (no max tokens phrase) retries once and succeeds (used_fallback=False)",
+        ok7b,
+        f"used_fallback={resp7b.used_fallback}, decision={resp7b.decision}, api_calls={mock_client_400_gen.chat.completions.create.call_count}"
     ))
 
     # -------------------------------------------------------------------------
