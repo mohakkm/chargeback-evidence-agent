@@ -208,6 +208,107 @@ def run_tests():
     ))
 
     # -------------------------------------------------------------------------
+    # TEST 7: Groq 400 json_validate_failed max completion tokens -> compact retry success (used_fallback=False)
+    # -------------------------------------------------------------------------
+    mock_client_400_json = MagicMock()
+    error_400_json = Exception("HTTP 400 Bad Request: json_validate_failed - failed_generation: max completion tokens reached before generating a valid document")
+
+    valid_llm_json_compact = {
+        "decision": "contest",
+        "confidence": 0.88,
+        "rebuttal_draft": "Compact LLM rebuttal draft under 120 words.",
+        "reasoning_summary": "Compact internal audit rationale under 35 words.",
+    }
+    success_response_compact = MockGroqResponse(valid_llm_json_compact)
+
+    mock_client_400_json.chat.completions.create.side_effect = [error_400_json, success_response_compact]
+
+    agent_400_json = DecisionAgent(api_key="fake_key")
+    agent_400_json._client = mock_client_400_json
+
+    with patch("time.sleep"), patch("time.monotonic", return_value=100.0):
+        resp7 = agent_400_json.evaluate_dispute(dispute=dispute_sparse, evidence=[], low_coverage=False)
+
+    call_args_list7 = mock_client_400_json.chat.completions.create.call_args_list
+    second_call_messages = call_args_list7[1].kwargs.get("messages", []) if len(call_args_list7) > 1 else []
+    second_call_sys_prompt = next((m["content"] for m in second_call_messages if m.get("role") == "system"), "")
+
+    ok7 = (
+        resp7.used_fallback is False and
+        resp7.decision == "contest" and
+        mock_client_400_json.chat.completions.create.call_count == 2 and
+        "120" in second_call_sys_prompt and
+        "35" in second_call_sys_prompt and
+        "2" in second_call_sys_prompt
+    )
+    results.append((
+        "TEST 7 - Groq 400 json_validate_failed max tokens retries once with compact prompt and succeeds (used_fallback=False)",
+        ok7,
+        f"used_fallback={resp7.used_fallback}, decision={resp7.decision}, api_calls={mock_client_400_json.chat.completions.create.call_count}, contains_compact_limits={'120' in second_call_sys_prompt and '35' in second_call_sys_prompt}"
+    ))
+
+    # -------------------------------------------------------------------------
+    # TEST 8: Different 400 error does NOT retry and immediately uses fallback
+    # -------------------------------------------------------------------------
+    mock_client_400_other = MagicMock()
+    mock_client_400_other.chat.completions.create.side_effect = Exception("HTTP 400 Bad Request: invalid_parameter_value")
+
+    agent_400_other = DecisionAgent(api_key="fake_key")
+    agent_400_other._client = mock_client_400_other
+
+    with patch("time.sleep"), patch("time.monotonic", return_value=100.0):
+        resp8 = agent_400_other.evaluate_dispute(dispute=dispute_sparse, evidence=[], low_coverage=False)
+
+    ok8 = (
+        resp8.used_fallback is True and
+        mock_client_400_other.chat.completions.create.call_count == 1
+    )
+    results.append((
+        "TEST 8 - Different 400 error (invalid parameter) does NOT retry and uses fallback",
+        ok8,
+        f"used_fallback={resp8.used_fallback}, calls={mock_client_400_other.chat.completions.create.call_count}"
+    ))
+
+    # -------------------------------------------------------------------------
+    # TEST 9: Evidence formatting is capped at 3 documents and truncated content
+    # -------------------------------------------------------------------------
+    five_evidences = [
+        CleanEvidenceInput(
+            evidence_id=f"EVD-00{i}",
+            doc_type=f"doc_type_{i}",
+            content="X" * 1000
+        )
+        for i in range(1, 6)
+    ]
+
+    mock_client_bound = MagicMock()
+    mock_client_bound.chat.completions.create.return_value = success_response
+
+    agent_bound = DecisionAgent(api_key="fake_key")
+    agent_bound._client = mock_client_bound
+
+    with patch("time.sleep"), patch("time.monotonic", return_value=100.0):
+        resp9 = agent_bound.evaluate_dispute(dispute=dispute_sparse, evidence=five_evidences, low_coverage=False)
+
+    call_messages9 = mock_client_bound.chat.completions.create.call_args.kwargs.get("messages", [])
+    user_prompt9 = next((m["content"] for m in call_messages9 if m.get("role") == "user"), "")
+
+    ok9 = (
+        "[Doc #1]" in user_prompt9 and
+        "[Doc #2]" in user_prompt9 and
+        "[Doc #3]" in user_prompt9 and
+        "[Doc #4]" not in user_prompt9 and
+        "[Doc #5]" not in user_prompt9 and
+        "... [TRUNCATED]" in user_prompt9
+    )
+    results.append((
+        "TEST 9 - Evidence formatting is capped at 3 documents and truncated content with marker",
+        ok9,
+        f"doc1={'[Doc #1]' in user_prompt9}, doc3={'[Doc #3]' in user_prompt9}, doc4_absent={'[Doc #4]' not in user_prompt9}, truncated={'... [TRUNCATED]' in user_prompt9}"
+    ))
+
+
+    # -------------------------------------------------------------------------
     # Print results
     # -------------------------------------------------------------------------
     for label, passed, details in results:

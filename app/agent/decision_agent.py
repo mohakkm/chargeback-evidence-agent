@@ -40,6 +40,12 @@ from app.config import GROQ_API_KEY, GROQ_MODEL
 # Maximum confidence allowed when low_coverage=True (calibration only, not action-gate logic)
 _LOW_COVERAGE_CONFIDENCE_CAP = 0.45
 
+# Evidence prompt bounding limits
+MAX_EVIDENCE_DOCS = 3
+MAX_EVIDENCE_CONTENT_CHARS = 500
+TRUNCATION_MARKER = "... [TRUNCATED]"
+
+
 
 class CleanDisputeInput(BaseModel):
     """Sanitized dispute case input - guaranteed free of ground-truth evaluation fields."""
@@ -173,6 +179,16 @@ class DecisionAgent:
         self._last_request_time = time.monotonic()
 
     @staticmethod
+    def _is_json_max_tokens_error(e: Exception) -> bool:
+        """
+        Detects HTTP 400 errors specifically caused by JSON validation failure due to max completion tokens limit.
+        """
+        err_str = str(e).lower()
+        status_code = getattr(e, "status_code", None)
+        is_400 = (status_code == 400) or ("400" in err_str) or ("bad request" in err_str) or ("badrequest" in err_str)
+        return is_400 and ("json_validate_failed" in err_str) and ("max completion tokens" in err_str)
+
+    @staticmethod
     def _is_rate_limit_error(e: Exception) -> bool:
         """
         Detects if an exception represents a 429 / Rate Limit error.
@@ -216,6 +232,111 @@ class DecisionAgent:
         default_backoffs = [5.0, 10.0, 20.0]
         idx = min(attempt - 1, len(default_backoffs) - 1)
         return default_backoffs[max(0, idx)]
+
+    def _build_system_prompt(self, compact: bool = False) -> str:
+        if compact:
+            return (
+                "You are a Senior Chargeback Dispute Operations Specialist at Razorpay.\n"
+                "Your task is to analyze credit card dispute claims against retrieved evidence documentation and decide whether the merchant should CONTEST the chargeback or submit NO CONTEST.\n\n"
+                "RULES:\n"
+                "1. Analyze the dispute reason code and card network rules.\n"
+                "2. Evaluate evidence documents for customer authorization, delivery, or terms compliance.\n"
+                "3. Decide 'contest' if evidence refutes customer claim; otherwise decide 'no_contest'.\n"
+                "4. CONFIDENCE CALIBRATION PRINCIPLE: Confidence must reflect evidence strength.\n"
+                "5. low_coverage=True means sparse evidence; factor into confidence score.\n"
+                "6. When decision is 'contest', write an ultra-compact Merchant Rebuttal Letter (rebuttal_draft, MAXIMUM 120 WORDS). "
+                "Cite at most 2 strongest specific evidence facts.\n"
+                "7. When decision is 'no_contest', set rebuttal_draft to an empty string ''.\n"
+                "8. Provide an ultra-concise reasoning_summary (MAXIMUM 35 WORDS) for internal audit logging.\n"
+                "9. Output ONLY a valid JSON object matching the requested schema."
+            )
+        return (
+            "You are a Senior Chargeback Dispute Operations Specialist at Razorpay.\n"
+            "Your task is to analyze credit card dispute claims against retrieved evidence documentation and decide whether the merchant should CONTEST the chargeback or submit NO CONTEST.\n\n"
+            "RULES:\n"
+            "1. Analyze the dispute reason code and card network rules (Visa/Mastercard/Amex/Discover).\n"
+            "2. Evaluate whether the provided evidence documents prove customer authorization, proper delivery, non-defective condition, terms compliance, or valid processing.\n"
+            "3. If evidence is compelling and refutes the customer claim, decide 'contest'.\n"
+            "4. If evidence is missing, weak, or supports the customer claim, decide 'no_contest'.\n"
+            "5. CONFIDENCE CALIBRATION PRINCIPLE: Confidence must reflect the amount and strength of evidence actually available, not merely whether a plausible decision can be suggested. "
+            "If the available evidence is insufficient to make a confident determination in either direction, output low confidence regardless of which way you lean on the decision. "
+            "Do not output high confidence simply because you can form a plausible argument - high confidence requires strong, specific, directly relevant evidence.\n"
+            "6. low_coverage=True in the user prompt means fewer than 2 evidence documents were retrieved. "
+            "Factor this into your raw confidence score naturally (sparse evidence -> lower confidence). "
+            "Do not use low_coverage to override a 'contest' decision to 'no_contest' - make the best decision the evidence supports regardless.\n"
+            "7. When decision is 'contest', write a concise, formal, point-by-point Merchant Rebuttal Letter (rebuttal_draft, MAXIMUM 250 WORDS) addressed to the acquiring bank dispute committee. "
+            "Cite at most the 3 strongest specific evidence facts.\n"
+            "8. When decision is 'no_contest', set rebuttal_draft to an empty string ''.\n"
+            "9. Provide a concise reasoning_summary (MAXIMUM 60 WORDS) for internal audit logging.\n"
+            "10. Output ONLY a valid JSON object matching the requested schema."
+        )
+
+    def _build_user_prompt(
+        self,
+        dispute: CleanDisputeInput,
+        evidence: List[CleanEvidenceInput],
+        low_coverage: bool
+    ) -> str:
+        sliced_evidence = evidence[:MAX_EVIDENCE_DOCS] if evidence else []
+        formatted_evidence = ""
+        if not sliced_evidence:
+            formatted_evidence = "No evidence documents retrieved for this dispute."
+        else:
+            for idx, ev in enumerate(sliced_evidence, start=1):
+                content = ev.content
+                if len(content) > MAX_EVIDENCE_CONTENT_CHARS:
+                    content = content[:MAX_EVIDENCE_CONTENT_CHARS] + TRUNCATION_MARKER
+                formatted_evidence += f"\n[Doc #{idx}] ID: {ev.evidence_id} | Type: {ev.doc_type}\nContent: {content}\n"
+
+        return (
+            f"DISPUTE CASE DETAILS:\n"
+            f"- Reason Code: {dispute.dispute_reason_code}\n"
+            f"- Amount: ${dispute.dispute_amount:.2f}\n"
+            f"- Merchant Category: {dispute.merchant_category}\n"
+            f"- Customer Claim Text: \"{dispute.customer_claim_text}\"\n\n"
+            f"RETRIEVED EVIDENCE DOCUMENTS ({len(sliced_evidence)} docs, low_coverage={low_coverage}):\n"
+            f"{formatted_evidence}\n\n"
+            f"Respond strictly with a JSON object containing keys:\n"
+            f'{{"decision": "contest" | "no_contest", "confidence": <float 0-1>, "rebuttal_draft": "<string>", "reasoning_summary": "<string>"}}'
+        )
+
+    def _call_groq_completions(self, system_prompt: str, user_prompt: str) -> str:
+        """
+        Executes Groq chat completion request with pacing and 429 rate limit retries.
+        """
+        max_retries_str = os.environ.get("GROQ_MAX_RATE_LIMIT_RETRIES", "3")
+        try:
+            max_retries = int(max_retries_str)
+        except ValueError:
+            max_retries = 3
+
+        attempt = 0
+        while True:
+            self._apply_pacing()
+            try:
+                response = self._client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.1,
+                    max_tokens=1024,
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                if self._is_rate_limit_error(e) and attempt < max_retries:
+                    attempt += 1
+                    wait_seconds = self._parse_retry_delay(e, attempt)
+                    print(
+                        f"[DecisionAgent] Groq rate limit hit (429). "
+                        f"Waiting {wait_seconds:.1f}s before retry {attempt}/{max_retries}..."
+                    )
+                    time.sleep(wait_seconds)
+                    self._last_request_time = time.monotonic()
+                else:
+                    raise e
 
     def evaluate_dispute(
         self,
@@ -277,84 +398,25 @@ class DecisionAgent:
         """
         Executes structured JSON reasoning via Groq Chat Completions API with rate-limit retries & pacing.
         Sets used_fallback=False on all successful Groq responses.
+        Includes a specialized compact retry path for HTTP 400 json_validate_failed max completion token errors.
         """
-        system_prompt = (
-            "You are a Senior Chargeback Dispute Operations Specialist at Razorpay.\n"
-            "Your task is to analyze credit card dispute claims against retrieved evidence documentation and decide whether the merchant should CONTEST the chargeback or submit NO CONTEST.\n\n"
-            "RULES:\n"
-            "1. Analyze the dispute reason code and card network rules (Visa/Mastercard/Amex/Discover).\n"
-            "2. Evaluate whether the provided evidence documents prove customer authorization, proper delivery, non-defective condition, terms compliance, or valid processing.\n"
-            "3. If evidence is compelling and refutes the customer claim, decide 'contest'.\n"
-            "4. If evidence is missing, weak, or supports the customer claim, decide 'no_contest'.\n"
-            "5. CONFIDENCE CALIBRATION PRINCIPLE: Confidence must reflect the amount and strength of evidence actually available, not merely whether a plausible decision can be suggested. "
-            "If the available evidence is insufficient to make a confident determination in either direction, output low confidence regardless of which way you lean on the decision. "
-            "Do not output high confidence simply because you can form a plausible argument - high confidence requires strong, specific, directly relevant evidence.\n"
-            "6. low_coverage=True in the user prompt means fewer than 2 evidence documents were retrieved. "
-            "Factor this into your raw confidence score naturally (sparse evidence -> lower confidence). "
-            "Do not use low_coverage to override a 'contest' decision to 'no_contest' - make the best decision the evidence supports regardless.\n"
-            "7. When decision is 'contest', write a formal, highly professional, point-by-point Merchant Rebuttal Letter (rebuttal_draft) addressed to the acquiring bank dispute committee. "
-            "Cite specific order IDs, tracking numbers, timestamps, IP addresses, 2FA/3DS proof, or policy clauses from the evidence documents.\n"
-            "8. When decision is 'no_contest', set rebuttal_draft to an empty string ''.\n"
-            "9. Provide a concise 2-3 sentence reasoning_summary for internal audit logging.\n"
-            "10. Output ONLY a valid JSON object matching the requested schema."
-        )
+        sys_prompt = self._build_system_prompt(compact=False)
+        usr_prompt = self._build_user_prompt(dispute, evidence, low_coverage)
 
-        formatted_evidence = ""
-        if not evidence:
-            formatted_evidence = "No evidence documents retrieved for this dispute."
-        else:
-            for idx, ev in enumerate(evidence, start=1):
-                formatted_evidence += f"\n[Doc #{idx}] ID: {ev.evidence_id} | Type: {ev.doc_type}\nContent: {ev.content}\n"
-
-        user_prompt = (
-            f"DISPUTE CASE DETAILS:\n"
-            f"- Reason Code: {dispute.dispute_reason_code}\n"
-            f"- Amount: ${dispute.dispute_amount:.2f}\n"
-            f"- Merchant Category: {dispute.merchant_category}\n"
-            f"- Customer Claim Text: \"{dispute.customer_claim_text}\"\n\n"
-            f"RETRIEVED EVIDENCE DOCUMENTS ({len(evidence)} docs, low_coverage={low_coverage}):\n"
-            f"{formatted_evidence}\n\n"
-            f"Respond strictly with a JSON object containing keys:\n"
-            f'{{"decision": "contest" | "no_contest", "confidence": <float 0-1>, "rebuttal_draft": "<string>", "reasoning_summary": "<string>"}}'
-        )
-
-        max_retries_str = os.environ.get("GROQ_MAX_RATE_LIMIT_RETRIES", "3")
         try:
-            max_retries = int(max_retries_str)
-        except ValueError:
-            max_retries = 3
-
-        attempt = 0
-        response = None
-
-        while True:
-            self._apply_pacing()
-            try:
-                response = self._client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.1,
-                    max_tokens=1024,
+            raw_json = self._call_groq_completions(sys_prompt, usr_prompt)
+        except Exception as e:
+            if self._is_json_max_tokens_error(e):
+                print(
+                    "[DecisionAgent] Groq HTTP 400 json_validate_failed (max completion tokens) encountered. "
+                    "Retrying once with compact prompt..."
                 )
-                break
-            except Exception as e:
-                if self._is_rate_limit_error(e) and attempt < max_retries:
-                    attempt += 1
-                    wait_seconds = self._parse_retry_delay(e, attempt)
-                    print(
-                        f"[DecisionAgent] Groq rate limit hit (429). "
-                        f"Waiting {wait_seconds:.1f}s before retry {attempt}/{max_retries}..."
-                    )
-                    time.sleep(wait_seconds)
-                    self._last_request_time = time.monotonic()
-                else:
-                    raise e
+                compact_sys_prompt = self._build_system_prompt(compact=True)
+                compact_usr_prompt = self._build_user_prompt(dispute, evidence, low_coverage)
+                raw_json = self._call_groq_completions(compact_sys_prompt, compact_usr_prompt)
+            else:
+                raise e
 
-        raw_json = response.choices[0].message.content
         data = json.loads(raw_json)
 
         decision = str(data.get("decision", "no_contest")).lower()
