@@ -21,7 +21,8 @@ GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 QDRANT_HOST: str = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", "6333"))
 
-# Bounded Action Gate
+# Bounded Action Gate — TRAIN-selected via calibration_results.jsonl (see app/eval/select_threshold.py)
+# Locked at 0.70: first threshold excluding eligible cases (coverage 0.762) with >=90% precision.
 AUTO_SUBMIT_CONFIDENCE_THRESHOLD: float = float(
-    os.getenv("AUTO_SUBMIT_CONFIDENCE_THRESHOLD", "0.80")
+    os.getenv("AUTO_SUBMIT_CONFIDENCE_THRESHOLD", "0.70")
 )

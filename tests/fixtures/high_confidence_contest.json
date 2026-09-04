@@ -1,0 +1,42 @@
+{
+  "scenario": "high_confidence_contest",
+  "dispute": {
+    "case_id": "FIXTURE-CONTEST-01",
+    "transaction_id": "txn_fixture_contest",
+    "merchant_category": "ecommerce",
+    "dispute_reason_code": "unauthorized_transaction",
+    "dispute_amount": 249.99,
+    "customer_claim_text": "I did not authorize this charge."
+  },
+  "retrieval": {
+    "retrieved_evidence": [
+      {
+        "evidence_id": "EVD-FIX-01",
+        "doc_type": "auth_log",
+        "content": "3DS authentication verified. OTP confirmed. AVS match Y/Y."
+      },
+      {
+        "evidence_id": "EVD-FIX-02",
+        "doc_type": "order_details",
+        "content": "Order fulfilled. Customer IP matches billing address."
+      }
+    ],
+    "retrieval_count": 2,
+    "scoped_count": 2,
+    "low_coverage": false,
+    "retrieved_evidence_ids": ["EVD-FIX-01", "EVD-FIX-02"]
+  },
+  "llm_response": {
+    "decision": "contest",
+    "confidence": 0.92,
+    "rebuttal_draft": "Merchant records demonstrate 3DS authentication and AVS match for the disputed transaction.",
+    "reasoning_summary": "Strong authorization evidence refutes the unauthorized transaction claim."
+  },
+  "expected": {
+    "decision": "contest",
+    "confidence": 0.92,
+    "action": "auto_submit",
+    "used_fallback": false,
+    "low_coverage": false
+  }
+}

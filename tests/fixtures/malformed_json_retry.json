@@ -1,0 +1,58 @@
+{
+  "scenario": "malformed_json_retry",
+  "dispute": {
+    "case_id": "FIXTURE-RETRY-01",
+    "transaction_id": "txn_fixture_retry",
+    "merchant_category": "ecommerce",
+    "dispute_reason_code": "credit_not_processed",
+    "dispute_amount": 45.0,
+    "customer_claim_text": "Refund was promised but never received."
+  },
+  "retrieval": {
+    "retrieved_evidence": [
+      {
+        "evidence_id": "EVD-FIX-05",
+        "doc_type": "refund_policy",
+        "content": "Refunds processed within 5-7 business days after approval."
+      },
+      {
+        "evidence_id": "EVD-FIX-06",
+        "doc_type": "communication_log",
+        "content": "Support ticket closed: refund issued on 2026-08-01."
+      }
+    ],
+    "retrieval_count": 2,
+    "scoped_count": 2,
+    "low_coverage": false,
+    "retrieved_evidence_ids": ["EVD-FIX-05", "EVD-FIX-06"]
+  },
+  "groq_side_effects": [
+    {
+      "type": "error",
+      "message": "HTTP 400 Bad Request: json_validate_failed - failed to generate json"
+    },
+    {
+      "type": "response",
+      "body": {
+        "decision": "contest",
+        "confidence": 0.79,
+        "rebuttal_draft": "Refund confirmation and policy compliance documented in support records.",
+        "reasoning_summary": "Compact retry succeeded after initial JSON validation failure."
+      }
+    }
+  ],
+  "llm_response": {
+    "decision": "contest",
+    "confidence": 0.79,
+    "rebuttal_draft": "Refund confirmation and policy compliance documented in support records.",
+    "reasoning_summary": "Compact retry succeeded after initial JSON validation failure."
+  },
+  "expected": {
+    "decision": "contest",
+    "confidence": 0.79,
+    "action": "flag_for_review",
+    "used_fallback": false,
+    "low_coverage": false,
+    "groq_call_count": 2
+  }
+}

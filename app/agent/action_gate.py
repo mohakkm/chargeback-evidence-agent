@@ -5,9 +5,10 @@ Decides whether to auto-submit a contest response or flag it for human review,
 based on the decision agent's output and evidence coverage.
 
 THRESHOLD SELECTION NOTE:
-    The final AUTO_SUBMIT_CONFIDENCE_THRESHOLD value must be selected using
-    TRAIN split results only during Phase 4 evaluation. It must never be tuned
-    against holdout results — holdout is reserved for unbiased final reporting.
+    AUTO_SUBMIT_THRESHOLD is locked from TRAIN calibration_results.jsonl only
+    (app/eval/select_threshold.py). Selected value: 0.70 — first threshold where
+    the confidence gate excludes eligible cases (coverage 0.762 vs 100% flat
+    below 0.70); precision 93.8% at n=16 auto-submit cases. Never tune on holdout.
 
 Action logic (only two possible actions — no automatic rejection):
     "auto_submit"      — only when ALL three conditions hold:
@@ -27,8 +28,9 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.config import AUTO_SUBMIT_CONFIDENCE_THRESHOLD
 
-# Named module-level constant drawn from config — never use a numeric literal inline.
-CONTEST_AUTO_SUBMIT_THRESHOLD: float = AUTO_SUBMIT_CONFIDENCE_THRESHOLD
+# TRAIN-locked auto-submit threshold (override via AUTO_SUBMIT_CONFIDENCE_THRESHOLD in .env).
+AUTO_SUBMIT_THRESHOLD: float = AUTO_SUBMIT_CONFIDENCE_THRESHOLD
+CONTEST_AUTO_SUBMIT_THRESHOLD: float = AUTO_SUBMIT_THRESHOLD
 
 _VALID_DECISIONS = frozenset({"contest", "no_contest"})
 _VALID_ACTIONS = frozenset({"auto_submit", "flag_for_review"})

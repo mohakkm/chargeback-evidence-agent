@@ -27,7 +27,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, Literal, Tuple
+from typing import Any, Dict, List, Optional, Set, Union, Literal, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -37,6 +37,16 @@ from app.eval.metrics import compute_evaluation_metrics, EvaluationMetricsSummar
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASETS_DIR: Path = _PROJECT_ROOT / "app" / "data" / "datasets"
+DEFAULT_CONSOLIDATED_AUDIT_PATH: Path = _PROJECT_ROOT / "train_audit_consolidated.jsonl"
+DEFAULT_HOLDOUT_CONSOLIDATED_AUDIT_PATH: Path = _PROJECT_ROOT / "holdout_audit_consolidated.jsonl"
+DEFAULT_HOLDOUT_RESUME_PATH: Path = _PROJECT_ROOT / "holdout_results.jsonl"
+DEFAULT_HOLDOUT_AUDIT_LOG_PATH: Path = _PROJECT_ROOT / "audit_logs_holdout.jsonl"
+# Interrupted-run audit logs salvaged before resume/checkpoint workflow existed.
+SALVAGED_AUDIT_LOG_PATHS: Tuple[Path, ...] = (
+    _PROJECT_ROOT / "audit_logs_train_calibration_clean.jsonl",
+    _PROJECT_ROOT / "audit_logs_train_calibration_run3.jsonl",
+    _PROJECT_ROOT / "audit_logs_train_calibration_final.jsonl",
+)
 
 SAFE_DISPUTE_FIELDS = (
     "case_id",
@@ -152,6 +162,166 @@ def load_dataset_split(
     return cases
 
 
+def _load_resume_records(
+    resume_from_path: Optional[Union[str, Path]],
+) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
+    """
+    Parse a resume JSONL file into case_id -> record (latest timestamp_utc wins).
+
+    Malformed JSON lines are counted, never silently dropped. Prints a stderr summary:
+      "resume index: N loaded, M malformed lines skipped, F missing files."
+
+    Returns (index, malformed_line_count, missing_files_count).
+    """
+    if resume_from_path is None:
+        return {}, 0, 0
+
+    p = Path(resume_from_path)
+    missing_files = 0
+    malformed = 0
+
+    if not p.exists():
+        missing_files = 1
+        print(
+            f"resume index: 0 loaded, 0 malformed lines skipped, {missing_files} missing files.",
+            file=sys.stderr,
+        )
+        return {}, malformed, missing_files
+
+    index: Dict[str, Dict[str, Any]] = {}
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            if rec.get("used_fallback") is False:
+                cid = rec.get("case_id")
+                if cid:
+                    ts = rec.get("timestamp_utc", "")
+                    if cid not in index or ts > index[cid].get("timestamp_utc", ""):
+                        index[cid] = rec
+        except json.JSONDecodeError:
+            malformed += 1
+
+    print(
+        f"resume index: {len(index)} loaded, {malformed} malformed lines skipped, {missing_files} missing files.",
+        file=sys.stderr,
+    )
+    return index, malformed, missing_files
+
+
+def load_resume_index(
+    resume_from_path: Optional[Union[str, Path]]
+) -> Set[str]:
+    """
+    Loads a JSONL file of previously completed results and returns the set of
+    case_ids that were already successfully evaluated by the live LLM
+    (used_fallback=False).
+
+    Malformed lines are counted and reported to stderr — they are never silently dropped.
+    Missing files are also reported. Summary format:
+      "resume index: N loaded, M malformed lines skipped, F missing files."
+    """
+    index, _, _ = _load_resume_records(resume_from_path)
+    return set(index.keys())
+
+
+def default_consolidation_source_paths(
+    resume_from_path: Optional[Union[str, Path]] = None,
+    run_audit_log_path: Optional[Union[str, Path]] = None,
+) -> List[Path]:
+    """
+    Build the ordered list of JSONL sources for train audit consolidation:
+    salvaged interrupted-run logs, then resume checkpoint, then this run's audit log.
+    """
+    sources: List[Path] = list(SALVAGED_AUDIT_LOG_PATHS)
+    if resume_from_path is not None:
+        sources.append(Path(resume_from_path))
+    if run_audit_log_path is not None:
+        sources.append(Path(run_audit_log_path))
+    return sources
+
+
+def consolidate_audit_trail(
+    source_paths: List[Union[str, Path]],
+    output_path: Union[str, Path],
+    expected_case_ids: Optional[Set[str]] = None,
+) -> int:
+    """
+    Merges multiple JSONL audit log files into one canonical file at output_path.
+
+    Deduplication rule: one row per case_id, latest timestamp_utc wins.
+    Malformed lines and entries without a case_id are skipped with a stderr warning.
+
+    If expected_case_ids is provided, raises RuntimeError after merging if any
+    expected case_id is absent from the output — never emits a partial file silently.
+
+    Returns the number of unique case_id rows written.
+    """
+    best: Dict[str, Dict[str, Any]] = {}
+    total_lines = 0
+    malformed = 0
+
+    for src in source_paths:
+        src_path = Path(src)
+        if not src_path.exists():
+            print(
+                f"[consolidate_audit_trail] WARNING: source file not found, skipping: {src_path}",
+                file=sys.stderr,
+            )
+            continue
+        for line in src_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            total_lines += 1
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                malformed += 1
+                print(
+                    f"[consolidate_audit_trail] WARNING: malformed line in {src_path.name}, skipping.",
+                    file=sys.stderr,
+                )
+                continue
+            cid = rec.get("case_id")
+            if not cid:
+                print(
+                    f"[consolidate_audit_trail] WARNING: line without case_id in {src_path.name}, skipping.",
+                    file=sys.stderr,
+                )
+                continue
+            ts = rec.get("timestamp_utc", "")
+            if cid not in best or ts > best[cid].get("timestamp_utc", ""):
+                best[cid] = rec
+
+    out = Path(output_path)
+    # Validate completeness BEFORE writing
+    if expected_case_ids is not None:
+        missing = sorted(expected_case_ids - set(best.keys()))
+        if missing:
+            raise RuntimeError(
+                f"consolidate_audit_trail: {len(missing)} expected case_id(s) missing from merged output "
+                f"— refusing to write a partial file. Missing: {missing}"
+            )
+        rows = sorted(
+            (best[cid] for cid in expected_case_ids),
+            key=lambda r: r.get("case_id", ""),
+        )
+    else:
+        rows = sorted(best.values(), key=lambda r: r.get("case_id", ""))
+    content = "".join(json.dumps(row) + "\n" for row in rows)
+
+    out.write_text(content, encoding="utf-8")
+    print(
+        f"[consolidate_audit_trail] Wrote {len(rows)} rows to {out} "
+        f"(from {total_lines} total input lines; {malformed} malformed skipped).",
+        file=sys.stderr,
+    )
+    return len(rows)
+
+
 def _execute_evaluation_pipeline(
     split: str,
     retriever: Optional[Any] = None,
@@ -162,10 +332,16 @@ def _execute_evaluation_pipeline(
     allow_fallback: bool = False,
     cost_multiplier: float = 1.0,
     fixed_fee: float = 0.0,
+    resume_from_path: Optional[Union[str, Path]] = None,
 ) -> Tuple[List[Dict[str, Any]], EvaluationMetricsSummary, int, Path, int]:
     """
     Internal helper that executes the full safe pipeline over a dataset split
     and retains in-memory evaluation records for internal callers.
+
+    If resume_from_path is provided, case_ids already present in that file with
+    used_fallback=False are skipped; their records are replayed into eval_records
+    from the resume file so that metrics are computed over the full dataset.
+    Each new result is appended to resume_from_path immediately on receipt.
     """
     split_name = str(split).lower().strip()
     if split_name not in ("train", "holdout"):
@@ -182,12 +358,41 @@ def _execute_evaluation_pipeline(
     raw_cases = load_dataset_split(split=split_name, datasets_dir=datasets_dir)
     target_audit_path = Path(audit_log_path) if audit_log_path is not None else DEFAULT_AUDIT_LOG_PATH
 
+    # --- Resume index: map case_id -> completed audit record ---
+    resume_index, _, _ = _load_resume_records(resume_from_path)
+    if resume_index:
+        print(
+            f"[run_eval] Resume: {len(resume_index)} case(s) already completed "
+            f"(used_fallback=False) — skipping them.",
+            file=sys.stderr,
+        )
+
+    # Open resume file for unbuffered appending if requested
+    resume_append_fh = None
+    if resume_from_path is not None:
+        resume_append_fh = open(Path(resume_from_path), "a", encoding="utf-8", buffering=1)
+
     eval_records: List[Dict[str, Any]] = []
     fallback_count = 0
 
     for idx, raw_case in enumerate(raw_cases, start=1):
         # 1. Build safe dispute payload (zero eval fields)
         safe_dispute = make_safe_dispute_payload(raw_case)
+        case_id = safe_dispute.get("case_id", f"case_{idx}")
+
+        # --- Resume skip: replay completed record without calling LLM ---
+        if case_id in resume_index:
+            completed_rec = resume_index[case_id]
+            eval_records.append({
+                "decision": completed_rec.get("decision", "no_contest"),
+                "confidence": float(completed_rec.get("confidence", 0.0)),
+                "action": completed_rec.get("action", "flag_for_review"),
+                "low_coverage": bool(completed_rec.get("low_coverage", False)),
+                "used_fallback": False,
+                "label_winnable": bool(raw_case.get("label_winnable", False)),
+                "dispute_amount": float(raw_case.get("dispute_amount", 0.0)),
+            })
+            continue
 
         # 2. Retrieve evidence
         retrieval_output = retriever.retrieve_evidence_for_dispute(safe_dispute)
@@ -200,9 +405,10 @@ def _execute_evaluation_pipeline(
         if used_fallback is True:
             fallback_count += 1
             if require_live_llm and not allow_fallback:
-                case_id_str = safe_dispute.get("case_id", f"case_{idx}")
+                if resume_append_fh is not None:
+                    resume_append_fh.close()
                 raise RuntimeError(
-                    f"Evaluation halted on case '{case_id_str}': Fallback reasoner was used. "
+                    f"Evaluation halted on case '{case_id}': Fallback reasoner was used. "
                     f"Official evaluation requires a live LLM (require_live_llm=True). "
                     f"To run local smoke tests with fallback enabled, set allow_fallback=True."
                 )
@@ -220,6 +426,26 @@ def _execute_evaluation_pipeline(
             log_path=target_audit_path,
         )
 
+        # 5b. Append new result immediately to resume file (unbuffered, line=1)
+        if resume_append_fh is not None and used_fallback is False:
+            from datetime import datetime, timezone
+            resume_record = {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "case_id": case_id,
+                "transaction_id": safe_dispute.get("transaction_id", ""),
+                "dispute_reason_code": safe_dispute.get("dispute_reason_code", ""),
+                "retrieved_evidence_ids": retrieval_output.get("retrieved_evidence_ids", []),
+                "retrieval_count": retrieval_output.get("retrieval_count", 0),
+                "scoped_count": retrieval_output.get("scoped_count", 0),
+                "low_coverage": low_coverage,
+                "decision": gate_output.decision,
+                "confidence": gate_output.confidence,
+                "reasoning_summary": getattr(decision_response, "reasoning_summary", ""),
+                "action": gate_output.action,
+                "used_fallback": False,
+            }
+            resume_append_fh.write(json.dumps(resume_record) + "\n")
+
         # 6. Create in-memory evaluation record (for metrics computation only)
         eval_records.append({
             "decision": gate_output.decision,
@@ -230,6 +456,9 @@ def _execute_evaluation_pipeline(
             "label_winnable": bool(raw_case.get("label_winnable", False)),
             "dispute_amount": float(raw_case.get("dispute_amount", 0.0)),
         })
+
+    if resume_append_fh is not None:
+        resume_append_fh.close()
 
     metrics_summary = compute_evaluation_metrics(
         case_results=eval_records,
@@ -251,6 +480,7 @@ def run_evaluation(
     allow_fallback: bool = False,
     cost_multiplier: float = 1.0,
     fixed_fee: float = 0.0,
+    resume_from_path: Optional[Union[str, Path]] = None,
 ) -> EvaluationRunSummary:
     """
     Executes end-to-end evaluation over a dataset split and returns an aggregate summary.
@@ -267,6 +497,7 @@ def run_evaluation(
         allow_fallback=allow_fallback,
         cost_multiplier=cost_multiplier,
         fixed_fee=fixed_fee,
+        resume_from_path=resume_from_path,
     )
 
     fallback_rate = (fallback_count / total_evaluated) if total_evaluated > 0 else 0.0
@@ -283,6 +514,75 @@ def run_evaluation(
         allow_fallback=allow_fallback,
         used_fallback_status=status_str,
     )
+
+
+def run_holdout_evaluation(
+    datasets_dir: Optional[Union[str, Path]] = None,
+    audit_log_path: Optional[Union[str, Path]] = None,
+    require_live_llm: bool = True,
+    allow_fallback: bool = False,
+    cost_multiplier: float = 1.0,
+    fixed_fee: float = 0.0,
+    retriever: Optional[Any] = None,
+    decision_agent: Optional[Any] = None,
+    resume_from_path: Optional[Union[str, Path]] = None,
+    consolidated_audit_path: Optional[Union[str, Path]] = None,
+) -> Tuple[EvaluationRunSummary, List[Dict[str, Any]]]:
+    """
+    Official HOLDOUT evaluation: full pipeline, resume-aware, consolidates audit log.
+
+    Threshold is NOT tuned here — uses locked AUTO_SUBMIT_THRESHOLD from config.
+    """
+    eval_records, metrics_summary, fallback_count, target_audit_path, total_evaluated = (
+        _execute_evaluation_pipeline(
+            split="holdout",
+            retriever=retriever,
+            decision_agent=decision_agent,
+            datasets_dir=datasets_dir,
+            audit_log_path=audit_log_path,
+            require_live_llm=require_live_llm,
+            allow_fallback=allow_fallback,
+            cost_multiplier=cost_multiplier,
+            fixed_fee=fixed_fee,
+            resume_from_path=resume_from_path,
+        )
+    )
+
+    out_path = (
+        Path(consolidated_audit_path)
+        if consolidated_audit_path is not None
+        else DEFAULT_HOLDOUT_CONSOLIDATED_AUDIT_PATH
+    )
+    sources: List[Path] = []
+    if resume_from_path is not None:
+        sources.append(Path(resume_from_path))
+    if target_audit_path.exists():
+        sources.append(target_audit_path)
+    raw_cases = load_dataset_split(split="holdout", datasets_dir=datasets_dir)
+    expected_ids: Set[str] = {
+        str(c.get("case_id", "")) for c in raw_cases if c.get("case_id")
+    }
+    consolidate_audit_trail(
+        source_paths=sources,
+        output_path=out_path,
+        expected_case_ids=expected_ids,
+    )
+
+    fallback_rate = (fallback_count / total_evaluated) if total_evaluated > 0 else 0.0
+    status_str = "all_llm" if fallback_count == 0 else "contains_fallback"
+
+    summary = EvaluationRunSummary(
+        split="holdout",
+        total_evaluated=total_evaluated,
+        metrics=metrics_summary,
+        audit_log_path=str(target_audit_path.resolve()),
+        fallback_count=fallback_count,
+        fallback_rate=round(fallback_rate, 6),
+        require_live_llm=require_live_llm,
+        allow_fallback=allow_fallback,
+        used_fallback_status=status_str,
+    )
+    return summary, eval_records
 
 
 def calibrate_auto_submit_threshold(
@@ -374,12 +674,19 @@ def run_train_threshold_calibration(
     retriever: Optional[Any] = None,
     decision_agent: Optional[Any] = None,
     split: str = "train",
+    resume_from_path: Optional[Union[str, Path]] = None,
+    consolidated_audit_path: Optional[Union[str, Path]] = None,
 ) -> ThresholdCalibrationReport:
     """
     Runs the full safe evaluation pipeline over the TRAIN split only and performs
     threshold calibration across candidate confidence thresholds.
 
     Rejects any attempt to specify split != 'train'.
+
+    After all train cases complete, consolidate_audit_trail() always runs: it merges
+    salvaged interrupted-run logs + resume checkpoint + this run's audit log into
+    train_audit_consolidated.jsonl (or consolidated_audit_path if overridden).
+    Fails loudly if any expected case_id is absent.
     """
     split_name = str(split).lower().strip()
     if split_name != "train":
@@ -388,7 +695,7 @@ def run_train_threshold_calibration(
             f"Tuning thresholds on holdout data is strictly prohibited to prevent data snooping."
         )
 
-    eval_records, _, _, _, _ = _execute_evaluation_pipeline(
+    eval_records, _, _, target_audit_path, _ = _execute_evaluation_pipeline(
         split="train",
         retriever=retriever,
         decision_agent=decision_agent,
@@ -398,6 +705,27 @@ def run_train_threshold_calibration(
         allow_fallback=allow_fallback,
         cost_multiplier=cost_multiplier,
         fixed_fee=fixed_fee,
+        resume_from_path=resume_from_path,
+    )
+
+    # --- Consolidation step: one canonical row per train case_id ---
+    out_path = (
+        Path(consolidated_audit_path)
+        if consolidated_audit_path is not None
+        else DEFAULT_CONSOLIDATED_AUDIT_PATH
+    )
+    sources = default_consolidation_source_paths(
+        resume_from_path=resume_from_path,
+        run_audit_log_path=target_audit_path,
+    )
+    raw_cases = load_dataset_split(split="train", datasets_dir=datasets_dir)
+    expected_ids: Set[str] = {
+        str(c.get("case_id", "")) for c in raw_cases if c.get("case_id")
+    }
+    consolidate_audit_trail(
+        source_paths=sources,
+        output_path=out_path,
+        expected_case_ids=expected_ids,
     )
 
     return calibrate_auto_submit_threshold(
@@ -449,6 +777,36 @@ def main(
         help="Directory containing train.jsonl and holdout.jsonl",
     )
     parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a JSONL file of previously completed results (e.g. calibration_results.jsonl). "
+            "On startup, case_ids already present with used_fallback=False are skipped. "
+            "Each new result is appended immediately to this file."
+        ),
+    )
+    parser.add_argument(
+        "--consolidated-audit-log",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path for merged canonical audit log. "
+            "holdout: holdout_audit_consolidated.jsonl (default). "
+            "calibrate-train: train_audit_consolidated.jsonl (default)."
+        ),
+    )
+    parser.add_argument(
+        "--official-holdout",
+        action="store_true",
+        help=(
+            "Run the one-shot official HOLDOUT evaluation with resume checkpoint "
+            f"(default resume: {DEFAULT_HOLDOUT_RESUME_PATH.name}) and consolidated audit."
+        ),
+    )
+    parser.add_argument(
         "--allow-fallback",
         action="store_true",
         help="Allow heuristic fallback reasoner (opt-in for local smoke testing only)",
@@ -469,6 +827,8 @@ def main(
     args = parser.parse_args(args_list)
 
     require_live_llm = not args.allow_fallback
+    resume_from_path = getattr(args, "resume_from", None)
+    consolidated_audit_path = getattr(args, "consolidated_audit_log", None)
 
     if args.calibrate_train:
         report = run_train_threshold_calibration(
@@ -482,8 +842,27 @@ def main(
             retriever=retriever,
             decision_agent=decision_agent,
             split="train",
+            resume_from_path=resume_from_path,
+            consolidated_audit_path=consolidated_audit_path,
         )
         print(json.dumps(report.model_dump(), indent=2))
+    elif getattr(args, "official_holdout", False) or args.split == "holdout":
+        holdout_resume = resume_from_path or str(DEFAULT_HOLDOUT_RESUME_PATH)
+        holdout_audit = args.audit_log_path or str(DEFAULT_HOLDOUT_AUDIT_LOG_PATH)
+        holdout_consolidated = consolidated_audit_path or str(DEFAULT_HOLDOUT_CONSOLIDATED_AUDIT_PATH)
+        summary, _ = run_holdout_evaluation(
+            datasets_dir=args.datasets_dir,
+            audit_log_path=holdout_audit,
+            require_live_llm=require_live_llm,
+            allow_fallback=args.allow_fallback,
+            cost_multiplier=args.cost_multiplier,
+            fixed_fee=args.fixed_fee,
+            retriever=retriever,
+            decision_agent=decision_agent,
+            resume_from_path=holdout_resume,
+            consolidated_audit_path=holdout_consolidated,
+        )
+        print(json.dumps(summary.model_dump(), indent=2))
     else:
         summary = run_evaluation(
             split=args.split,
@@ -495,6 +874,7 @@ def main(
             fixed_fee=args.fixed_fee,
             retriever=retriever,
             decision_agent=decision_agent,
+            resume_from_path=resume_from_path,
         )
         print(json.dumps(summary.model_dump(), indent=2))
 

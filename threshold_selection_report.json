@@ -1,0 +1,122 @@
+{
+  "split": "train",
+  "calibration_path": "C:\\Users\\Mohakk\\Desktop\\razorpay\\calibration_results.jsonl",
+  "train_dataset_path": "C:\\Users\\Mohakk\\Desktop\\razorpay\\app\\data\\datasets\\train.jsonl",
+  "total_calibration_rows": 90,
+  "eligible_count": 21,
+  "min_precision_target": 0.9,
+  "selected_threshold": 0.7,
+  "selected_precision": 0.9375,
+  "selected_coverage": 0.761905,
+  "justification": "Locked threshold 0.70 \u2014 first sweep point where the confidence gate excludes eligible cases (coverage 76.2% vs 100% flat below 0.70) while precision stays >=90% (93.8%); thresholds 0.50\u20130.65 share identical 90.5% precision at 100% coverage and do not filter on confidence.",
+  "precision_at_selected": {
+    "precision": 0.9375,
+    "ci_low": 0.716707,
+    "ci_high": 0.988881,
+    "n": 16,
+    "successes": 15,
+    "confidence_level": 0.95,
+    "summary": "precision 93.8%, 95% CI [71.7%, 98.9%], n=16"
+  },
+  "confidence_distinctness": {
+    "eligible_pool_size": 21,
+    "distinct_confidence_values": [
+      0.65,
+      0.66,
+      0.68,
+      0.72,
+      0.75,
+      0.78,
+      0.85,
+      0.88,
+      0.9,
+      0.92
+    ],
+    "value_counts": {
+      "0.65": 1,
+      "0.66": 2,
+      "0.68": 2,
+      "0.72": 1,
+      "0.75": 2,
+      "0.78": 2,
+      "0.85": 5,
+      "0.88": 1,
+      "0.90": 1,
+      "0.92": 4
+    },
+    "clusters_on_round_deciles": true,
+    "assessment": "Eligible-pool confidence values cluster near round deciles (0.5, 0.6, 0.7, 0.8, 0.9): distinct sorted values are [0.65, 0.66, 0.68, 0.72, 0.75, 0.78, 0.85, 0.88, 0.9, 0.92] with repeated ties (max 5 cases sharing one score). This is not a continuously calibrated score distribution \u2014 treat HOLDOUT threshold behavior as uncertain until re-checked."
+  },
+  "sweep": [
+    {
+      "threshold": 0.5,
+      "precision": 0.904762,
+      "coverage": 1.0,
+      "auto_submit_count": 21,
+      "eligible_count": 21
+    },
+    {
+      "threshold": 0.55,
+      "precision": 0.904762,
+      "coverage": 1.0,
+      "auto_submit_count": 21,
+      "eligible_count": 21
+    },
+    {
+      "threshold": 0.6,
+      "precision": 0.904762,
+      "coverage": 1.0,
+      "auto_submit_count": 21,
+      "eligible_count": 21
+    },
+    {
+      "threshold": 0.65,
+      "precision": 0.904762,
+      "coverage": 1.0,
+      "auto_submit_count": 21,
+      "eligible_count": 21
+    },
+    {
+      "threshold": 0.7,
+      "precision": 0.9375,
+      "coverage": 0.761905,
+      "auto_submit_count": 16,
+      "eligible_count": 21
+    },
+    {
+      "threshold": 0.75,
+      "precision": 0.933333,
+      "coverage": 0.714286,
+      "auto_submit_count": 15,
+      "eligible_count": 21
+    },
+    {
+      "threshold": 0.8,
+      "precision": 1.0,
+      "coverage": 0.52381,
+      "auto_submit_count": 11,
+      "eligible_count": 21
+    },
+    {
+      "threshold": 0.85,
+      "precision": 1.0,
+      "coverage": 0.52381,
+      "auto_submit_count": 11,
+      "eligible_count": 21
+    },
+    {
+      "threshold": 0.9,
+      "precision": 1.0,
+      "coverage": 0.238095,
+      "auto_submit_count": 5,
+      "eligible_count": 21
+    },
+    {
+      "threshold": 0.95,
+      "precision": 0.0,
+      "coverage": 0.0,
+      "auto_submit_count": 0,
+      "eligible_count": 21
+    }
+  ]
+}

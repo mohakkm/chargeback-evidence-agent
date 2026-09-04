@@ -32,6 +32,8 @@ from app.eval.run_eval import (
     EvaluationRunSummary,
     ThresholdCalibrationReport,
     BANNED_EVAL_FIELDS,
+    load_resume_index,
+    consolidate_audit_trail,
 )
 from app.agent.decision_agent import DecisionAgentResponse
 
@@ -300,6 +302,7 @@ def run_tests():
             holdout_err = str(exc)
 
         # 5b. Valid calibration on train split
+        consolidated_file = tmp_dir_path / "train_audit_consolidated.jsonl"
         report = run_train_threshold_calibration(
             datasets_dir=tmp_dir_path,
             candidate_thresholds=[0.70, 0.80, 0.90],
@@ -307,6 +310,7 @@ def run_tests():
             retriever=fake_retriever,
             decision_agent=fake_agent,
             split="train",
+            consolidated_audit_path=consolidated_file,
         )
 
         ok5 = (
@@ -380,6 +384,7 @@ def run_tests():
             "label_winnable": True,
         }
         train_file.write_text(json.dumps(case_item) + "\n", encoding="utf-8")
+        consolidated_file = tmp_dir_path / "train_audit_consolidated.jsonl"
 
         fake_retriever = FakeRetriever(low_coverage=False)
         fake_agent = FakeDecisionAgent(decision="contest", confidence=0.85, used_fallback=False)
@@ -395,6 +400,7 @@ def run_tests():
                     "--thresholds", "0.75", "0.85",
                     "--datasets-dir", str(tmp_dir_path),
                     "--audit-log-path", str(audit_file),
+                    "--consolidated-audit-log", str(consolidated_file),
                     "--allow-fallback",
                 ],
                 retriever=fake_retriever,
@@ -415,6 +421,83 @@ def run_tests():
             "TEST 7 - CLI argument parsing routes correctly to calibration mode without external calls",
             ok7,
             f"split={cli_data.get('split')}, candidates_count={len(cli_data.get('candidates', []))}"
+        ))
+
+    # ------------------------------------------------------------------
+    # TEST 8: load_resume_index counts malformed lines and reports to stderr
+    # ------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmpdir:
+        resume_file = Path(tmpdir) / "resume.jsonl"
+        resume_file.write_text(
+            json.dumps({"case_id": "CB-0001", "used_fallback": False, "timestamp_utc": "t1"}) + "\n"
+            + "not valid json\n"
+            + json.dumps({"case_id": "CB-0002", "used_fallback": False, "timestamp_utc": "t2"}) + "\n",
+            encoding="utf-8",
+        )
+        import io
+        err_capture = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = err_capture
+        try:
+            loaded = load_resume_index(resume_file)
+        finally:
+            sys.stderr = old_stderr
+
+        err_text = err_capture.getvalue()
+        ok8 = (
+            loaded == {"CB-0001", "CB-0002"}
+            and "resume index: 2 loaded, 1 malformed lines skipped, 0 missing files." in err_text
+        )
+        results.append((
+            "TEST 8 - load_resume_index counts malformed lines and prints stderr summary",
+            ok8,
+            f"loaded={loaded}, stderr={err_text.strip()!r}",
+        ))
+
+    # ------------------------------------------------------------------
+    # TEST 9: consolidate_audit_trail dedupes by latest timestamp and enforces completeness
+    # ------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        src_a = tmp / "a.jsonl"
+        src_b = tmp / "b.jsonl"
+        out = tmp / "merged.jsonl"
+        src_a.write_text(
+            json.dumps({"case_id": "CB-0001", "timestamp_utc": "2026-01-01", "decision": "old"}) + "\n",
+            encoding="utf-8",
+        )
+        src_b.write_text(
+            json.dumps({"case_id": "CB-0001", "timestamp_utc": "2026-02-01", "decision": "new"}) + "\n"
+            + json.dumps({"case_id": "CB-0002", "timestamp_utc": "2026-01-01", "decision": "x"}) + "\n",
+            encoding="utf-8",
+        )
+        row_count = consolidate_audit_trail(
+            source_paths=[src_a, src_b],
+            output_path=out,
+            expected_case_ids={"CB-0001", "CB-0002"},
+        )
+        merged = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line.strip()]
+        cb1 = next(r for r in merged if r["case_id"] == "CB-0001")
+        ok9 = row_count == 2 and cb1["decision"] == "new" and len(merged) == 2
+        results.append((
+            "TEST 9 - consolidate_audit_trail latest timestamp wins and writes expected row count",
+            ok9,
+            f"row_count={row_count}, cb1_decision={cb1.get('decision')}",
+        ))
+
+        missing_ok = False
+        try:
+            consolidate_audit_trail(
+                source_paths=[src_a],
+                output_path=tmp / "partial.jsonl",
+                expected_case_ids={"CB-0001", "CB-0002"},
+            )
+        except RuntimeError as exc:
+            missing_ok = "missing from merged output" in str(exc) and not (tmp / "partial.jsonl").exists()
+        results.append((
+            "TEST 9b - consolidate_audit_trail refuses partial file when case_ids missing",
+            missing_ok,
+            "RuntimeError raised and partial file not written" if missing_ok else "expected RuntimeError",
         ))
 
     # ------------------------------------------------------------------
